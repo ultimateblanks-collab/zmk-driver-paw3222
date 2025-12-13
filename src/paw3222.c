@@ -6,6 +6,7 @@
  * https://github.com/zephyrproject-rtos/zephyr/blob/19c6240b6865bcb28e1d786d4dcadfb3a02067a0/drivers/input/input_paw32xx.c
  *
  * SPDX-License-Identifier: Apache-2.0
+ * forked_stable_2025/12/13
  */
 
 #include <stdint.h>

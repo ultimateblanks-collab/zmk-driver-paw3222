@@ -67,6 +67,9 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 #define RES_STEP 38
 #define RES_MIN (16 * RES_STEP)
 #define RES_MAX (127 * RES_STEP)
+static int32_t last_time = 0;
+static int32_t subpixel_x = 0;
+static int32_t subpixel_y = 0;
 
 struct paw32xx_config {
     struct spi_dt_spec spi;
@@ -237,6 +240,64 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
     }
 
     LOG_DBG("x=%4d y=%4d", x, y);
+
+// ===== ここから追加 =====
+int32_t now = k_uptime_get();
+int32_t dt = now - last_time;
+last_time = now;
+
+// dt安定化
+if (dt < 1) dt = 1;
+if (dt > 20) dt = 20;
+
+// speed計算
+int32_t speed = (abs(x) + abs(y)) * 100 / dt;
+
+// 平滑化
+static int32_t smooth_speed = 0;
+smooth_speed = (smooth_speed * 3 + speed) / 4;
+speed = smooth_speed;
+
+// パラメータ
+int32_t min_accel = 400;
+int32_t max_accel = 3000;
+int32_t offset = 150;
+
+int32_t accel;
+
+// 低速専用
+if (speed < 70) {
+    accel = 400;
+} else {
+    accel = min_accel +
+        ((max_accel - min_accel) * speed) / (speed + offset);
+
+    if (accel > max_accel) accel = max_accel;
+}
+
+// ノイズ除去（PAW向け重要）
+if (abs(x) <= 1) x = 0;
+if (abs(y) <= 1) y = 0;
+
+// サブピクセル
+subpixel_x += x * accel;
+subpixel_y += y * accel;
+
+int16_t out_x = subpixel_x / 1000;
+int16_t out_y = subpixel_y / 1000;
+
+subpixel_x -= out_x * 1000;
+subpixel_y -= out_y * 1000;
+
+x = out_x;
+y = out_y;
+
+// クリップ
+if (x > 127) x = 127;
+if (x < -127) x = -127;
+if (y > 127) y = 127;
+if (y < -127) y = -127;
+// ===== ここまで追加 =====
 
     input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
     input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);

@@ -266,8 +266,8 @@ int32_t offset = 200;
 int32_t accel;
 
 // 低速専用
-if (speed < 100) {
-    accel = 300;
+if (speed < 150) {
+    accel = 400;
 } else {
     accel = min_accel +
         ((max_accel - min_accel) * speed) / (speed + offset);

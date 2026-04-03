@@ -70,7 +70,22 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 static int32_t last_time = 0;
 static int32_t subpixel_x = 0;
 static int32_t subpixel_y = 0;
+static inline int16_t apply_adaptive_filter(int16_t v, int32_t speed) {
+    int16_t a = abs(v);
 
+    // 低速ほど強く抑制（重要）
+    int32_t strength = 2 + (100 - speed) / 50;
+
+    if (strength < 1) strength = 1;
+    if (strength > 4) strength = 4;
+
+    if (a <= strength) {
+        return 0;
+    }
+
+    // 非線形スケーリング（滑らかさの本体）
+    return (v * (a - strength)) / a;
+}
 struct paw32xx_config {
     struct spi_dt_spec spi;
     struct gpio_dt_spec irq_gpio;
@@ -241,7 +256,9 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
 
     LOG_DBG("x=%4d y=%4d", x, y);
 
-// ===== ここから追加 =====
+// ===== ここから（read_xy直後） =====
+
+// 時間計測
 int32_t now = k_uptime_get();
 int32_t dt = now - last_time;
 last_time = now;
@@ -253,20 +270,23 @@ if (dt > 20) dt = 20;
 // speed計算
 int32_t speed = (abs(x) + abs(y)) * 100 / dt;
 
-// 平滑化
+// 平滑化（重要）
 static int32_t smooth_speed = 0;
 smooth_speed = (smooth_speed * 3 + speed) / 4;
 speed = smooth_speed;
 
-// パラメータ
-int32_t min_accel = 300;
+// ===== ここでノイズ処理（★今回追加の本体）=====
+x = apply_adaptive_filter(x, speed);
+y = apply_adaptive_filter(y, speed);
+
+// ===== 加速処理 =====
+int32_t min_accel = 400;
 int32_t max_accel = 3000;
-int32_t offset = 200;
+int32_t offset = 150;
 
 int32_t accel;
 
-// 低速専用
-if (speed < 150) {
+if (speed < 70) {
     accel = 400;
 } else {
     accel = min_accel +
@@ -275,11 +295,7 @@ if (speed < 150) {
     if (accel > max_accel) accel = max_accel;
 }
 
-// ノイズ除去（PAW向け重要）
-if (abs(x) <= 1) x = 0;
-if (abs(y) <= 1) y = 0;
-
-// サブピクセル
+// ===== サブピクセル =====
 subpixel_x += x * accel;
 subpixel_y += y * accel;
 
@@ -297,7 +313,8 @@ if (x > 127) x = 127;
 if (x < -127) x = -127;
 if (y > 127) y = 127;
 if (y < -127) y = -127;
-// ===== ここまで追加 =====
+
+// ===== ここまで =====
 
     input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
     input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);

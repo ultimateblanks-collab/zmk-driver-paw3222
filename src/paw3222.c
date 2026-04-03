@@ -288,9 +288,10 @@ if (speed < 150) {
 }
 
 // ノイズ除去（PAW向け重要）
-if (abs(x) <= 1) x = 0;
-if (abs(y) <= 1) y = 0;
-
+if (speed < 50) {
+    if (abs(x) <= 2) x = 0;
+    if (abs(y) <= 2) y = 0;
+}
 // サブピクセル
 subpixel_x += x * accel;
 subpixel_y += y * accel;

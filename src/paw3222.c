@@ -272,14 +272,14 @@ speed = smooth_speed;
 
 // パラメータ
 int32_t min_accel = 400;
-int32_t max_accel = 4000;
-int32_t offset = 150;
+int32_t max_accel = 2000;
+int32_t offset = 250;
 
 int32_t accel;
 
 // 低速専用
-if (speed < 80) {
-    accel = 400;
+if (speed < 70) {
+    accel = 320;
 } else {
     accel = min_accel +
         ((max_accel - min_accel) * speed) / (speed + offset);
@@ -288,7 +288,7 @@ if (speed < 80) {
 }
 
 // ノイズ除去（PAW向け重要）
-if (speed < 50) {
+if (speed < 70) {
     if (abs(x) <= 1) x = 0;
     if (abs(y) <= 1) y = 0;
 }

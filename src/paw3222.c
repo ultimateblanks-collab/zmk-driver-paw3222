@@ -272,7 +272,7 @@ speed = smooth_speed;
 
 // パラメータ
 int32_t min_accel = 400;
-int32_t max_accel = 2700;
+int32_t max_accel = 3200;
 int32_t offset = 220;
 
 int32_t accel;

@@ -272,14 +272,14 @@ speed = smooth_speed;
 
 // パラメータ
 int32_t min_accel = 400;
-int32_t max_accel = 3200;
+int32_t max_accel = 2800;
 int32_t offset = 220;
 
 int32_t accel;
 
 // 低速専用
 if (speed < 70) {
-    accel = 270;
+    accel = 250;
 } else {
     accel = min_accel +
         ((max_accel - min_accel) * speed) / (speed + offset);

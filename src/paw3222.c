@@ -279,7 +279,7 @@ int32_t accel;
 
 // 低速専用
 if (speed < 70) {
-    accel = 250;
+    accel = 280;
 } else {
     accel = min_accel +
         ((max_accel - min_accel) * speed) / (speed + offset);

@@ -34,6 +34,6 @@ properties:
       disabled in runtime by the application using the paw32xx_force_awake()
       API.
 
-    motion-threshold:
+　motion-threshold:
     type: int
     default: 0

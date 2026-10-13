@@ -74,6 +74,7 @@ struct paw32xx_config {
     struct gpio_dt_spec power_gpio;
     int16_t res_cpi;
     bool force_awake;
+    uint8_t threshold;
 };
 
 struct paw32xx_data {
@@ -81,6 +82,9 @@ struct paw32xx_data {
     struct k_work motion_work;
     struct gpio_callback motion_cb;
     struct k_timer motion_timer; // Add timer for delayed motion checking
+    int16_t acc_x, acc_y;
+    bool moving;
+    int64_t last_motion;
 };
 
 // Define a custom sign_extend function to avoid conflict with Zephyr's implementation
@@ -232,9 +236,28 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
     }
 
     ret = paw32xx_read_xy(dev, &x, &y);
-    if (ret < 0) {
-        return;
+    if (cfg->threshold > 0 && (x || y)) {
+    int64_t now = k_uptime_get();
+    if (now - data->last_motion > 200) {   // 200ms無操作で静止扱い
+        data->moving = false;
+        data->acc_x = data->acc_y = 0;
     }
+    data->last_motion = now;
+    if (!data->moving) {
+        data->acc_x += x;
+        data->acc_y += y;
+        if (abs(data->acc_x) + abs(data->acc_y) < cfg->threshold) {
+            goto next;                     // まだ揺れとみなす
+        }
+        x = data->acc_x; y = data->acc_y;
+        data->acc_x = data->acc_y = 0;
+        data->moving = true;
+    }
+}
+input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
+input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+next:
+k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
 
     LOG_DBG("x=%4d y=%4d", x, y);
 
@@ -545,6 +568,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                               \
         .res_cpi = DT_INST_PROP_OR(n, res_cpi, -1),                                                \
         .force_awake = DT_INST_PROP(n, force_awake),                                               \
+        .threshold = DT_INST_PROP(n, motion_threshold),                                            \
     };                                                                                             \
                                                                                                    \
     static struct paw32xx_data paw32xx_data_##n;                                                   \

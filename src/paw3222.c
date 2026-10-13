@@ -6,7 +6,6 @@
  * https://github.com/zephyrproject-rtos/zephyr/blob/19c6240b6865bcb28e1d786d4dcadfb3a02067a0/drivers/input/input_paw32xx.c
  *
  * SPDX-License-Identifier: Apache-2.0
- * forked_stable_2025/12/13
  */
 
 #include <stdint.h>
@@ -68,13 +67,24 @@ LOG_MODULE_REGISTER(paw32xx, CONFIG_ZMK_LOG_LEVEL);
 #define RES_MIN (16 * RES_STEP)
 #define RES_MAX (127 * RES_STEP)
 
+/* ---- 微小揺れフィルタの調整値（motion-threshold > 0 のときのみ有効） ---- */
+/* この時間、移動がまったく無ければ静止状態に戻す */
+#define MOTION_IDLE_TIMEOUT_MS 200
+/* 静止状態で移動量を溜める時間幅。これを過ぎたら溜めた分を捨てて数え直す
+ * （揺れの累積でしきい値を超えてしまうのを防ぐ） */
+#define MOTION_ACC_WINDOW_MS 300
+/* 動作中に |x|+|y| がこの値以下のサンプルを「揺れ」とみなす */
+#define SMALL_MOTION_LIMIT 1
+/* 動作中に「揺れ」サンプルがこの回数連続したら静止状態に戻す（1回 ≒ 15ms） */
+#define SMALL_MOTION_COUNT 8
+
 struct paw32xx_config {
     struct spi_dt_spec spi;
     struct gpio_dt_spec irq_gpio;
     struct gpio_dt_spec power_gpio;
     int16_t res_cpi;
     bool force_awake;
-    uint8_t threshold;
+    uint16_t motion_threshold;
 };
 
 struct paw32xx_data {
@@ -82,10 +92,38 @@ struct paw32xx_data {
     struct k_work motion_work;
     struct gpio_callback motion_cb;
     struct k_timer motion_timer; // Add timer for delayed motion checking
-    int16_t acc_x, acc_y;
+
+    /* 微小揺れフィルタの状態 */
     bool moving;
+    int32_t acc_x;
+    int32_t acc_y;
+    uint8_t small_cnt;
     int64_t last_motion;
+    int64_t acc_start;
 };
+
+static int paw32xx_force_cs(const struct device *dev, bool force_low) {
+    const struct paw32xx_config *cfg = dev->config;
+    const struct gpio_dt_spec *cs = NULL;
+    int ret;
+
+    if (cfg->spi.config.cs.gpio.port != NULL) {
+        cs = &cfg->spi.config.cs.gpio;
+    }
+
+    if (cs == NULL || cs->port == NULL || !device_is_ready(cs->port)) {
+        LOG_ERR("CS GPIO not defined or not ready");
+        return ENODEV;
+    }
+
+    ret = gpio_pin_set_dt(cs, force_low ? 1 : 0);
+    if (ret < 0) {
+        LOG_ERR("Failed to drive CS pin: %d", ret);
+        return ret;
+    }
+
+    return 0;
+}
 
 // Define a custom sign_extend function to avoid conflict with Zephyr's implementation
 static inline int32_t _sign_extend(uint32_t value, uint8_t index) {
@@ -208,6 +246,93 @@ static int paw32xx_read_xy(const struct device *dev, int16_t *x, int16_t *y) {
     return 0;
 }
 
+static void paw32xx_filter_reset(struct paw32xx_data *data, int64_t now) {
+    data->moving = false;
+    data->acc_x = 0;
+    data->acc_y = 0;
+    data->small_cnt = 0;
+    data->acc_start = now;
+}
+
+/*
+ * 微小揺れフィルタ。
+ * 戻り値 true: この移動量をホストへ送る / false: 捨てる
+ *
+ * - 静止状態: 移動量を溜め、合計がしきい値に達したら動作状態へ移る。
+ *   溜めた分は送らずに捨てる（カーソルが飛ばないように）。
+ * - 動作状態: 移動量をそのまま送る。ただし完全停止が続く、
+ *   または小さい揺れだけが続いたら静止状態に戻る。
+ */
+static bool paw32xx_filter_motion(const struct device *dev, int16_t x, int16_t y) {
+    const struct paw32xx_config *cfg = dev->config;
+    struct paw32xx_data *data = dev->data;
+
+    if (cfg->motion_threshold == 0) {
+        return true; // フィルタ無効：従来どおり全部送る
+    }
+
+    if (x == 0 && y == 0) {
+        return false;
+    }
+
+    int64_t now = k_uptime_get();
+    int32_t mag = abs(x) + abs(y);
+
+    if (now - data->last_motion > MOTION_IDLE_TIMEOUT_MS) {
+        paw32xx_filter_reset(data, now);
+    }
+    data->last_motion = now;
+
+    if (data->moving) {
+        if (mag <= SMALL_MOTION_LIMIT) {
+            if (++data->small_cnt >= SMALL_MOTION_COUNT) {
+                paw32xx_filter_reset(data, now);
+                return false;
+            }
+        } else {
+            data->small_cnt = 0;
+        }
+        return true;
+    }
+
+    /* 静止状態 */
+    if (now - data->acc_start > MOTION_ACC_WINDOW_MS) {
+        data->acc_x = 0;
+        data->acc_y = 0;
+        data->acc_start = now;
+    }
+
+    data->acc_x += x;
+    data->acc_y += y;
+
+    if (abs(data->acc_x) + abs(data->acc_y) >= cfg->motion_threshold) {
+        data->moving = true;
+        data->acc_x = 0;
+        data->acc_y = 0;
+        data->small_cnt = 0;
+    }
+
+    return false;
+}
+
+static int paw32xx_interrupt_configure(const struct device *dev, gpio_flags_t flags) {
+    const struct paw32xx_config *cfg = dev->config;
+
+    if (!gpio_is_ready_dt(&cfg->irq_gpio)) {
+        return -ENODEV;
+    }
+
+    return gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, flags);
+}
+
+static int paw32xx_interrupt_enable(const struct device *dev) {
+    return paw32xx_interrupt_configure(dev, GPIO_INT_LEVEL_ACTIVE);
+}
+
+static int paw32xx_interrupt_disable(const struct device *dev) {
+    return paw32xx_interrupt_configure(dev, GPIO_INT_DISABLE);
+}
+
 static void paw32xx_motion_timer_handler(struct k_timer *timer) {
     struct paw32xx_data *data = CONTAINER_OF(timer, struct paw32xx_data, motion_timer);
     k_work_submit(&data->motion_work);
@@ -228,7 +353,7 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
 
     if ((val & MOTION_STATUS_MOTION) == 0x00) {
         // No motion detected, re-enable interrupts and wait for next interrupt
-        gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+        paw32xx_interrupt_enable(dev);
 
         if (gpio_pin_get_dt(&cfg->irq_gpio) == 0) {
             return;
@@ -236,33 +361,16 @@ static void paw32xx_motion_work_handler(struct k_work *work) {
     }
 
     ret = paw32xx_read_xy(dev, &x, &y);
-    if (cfg->threshold > 0 && (x || y)) {
-    int64_t now = k_uptime_get();
-    if (now - data->last_motion > 200) {   // 200ms無操作で静止扱い
-        data->moving = false;
-        data->acc_x = data->acc_y = 0;
+    if (ret < 0) {
+        return;
     }
-    data->last_motion = now;
-    if (!data->moving) {
-        data->acc_x += x;
-        data->acc_y += y;
-        if (abs(data->acc_x) + abs(data->acc_y) < cfg->threshold) {
-            goto next;                     // まだ揺れとみなす
-        }
-        x = data->acc_x; y = data->acc_y;
-        data->acc_x = data->acc_y = 0;
-        data->moving = true;
-    }
-}
-input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
-input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
-next:
-k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
 
     LOG_DBG("x=%4d y=%4d", x, y);
 
-    input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
-    input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+    if (paw32xx_filter_motion(dev, x, y)) {
+        input_report_rel(data->dev, INPUT_REL_X, x, false, K_FOREVER);
+        input_report_rel(data->dev, INPUT_REL_Y, y, true, K_FOREVER);
+    }
 
     // Schedule next check after 15ms without using interrupts
     k_timer_start(&data->motion_timer, K_MSEC(15), K_NO_WAIT);
@@ -272,10 +380,12 @@ static void paw32xx_motion_handler(const struct device *gpio_dev, struct gpio_ca
                                    uint32_t pins) {
     struct paw32xx_data *data = CONTAINER_OF(cb, struct paw32xx_data, motion_cb);
     const struct device *dev = data->dev;
-    const struct paw32xx_config *cfg = dev->config;
+
+    ARG_UNUSED(gpio_dev);
+    ARG_UNUSED(pins);
 
     // Disable interrupts while timer is active
-    gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_DISABLE);
+    paw32xx_interrupt_disable(dev);
 
     // Cancel any pending timer
     k_timer_stop(&data->motion_timer);
@@ -363,6 +473,22 @@ static int paw32xx_configure(const struct device *dev) {
             if (retry_count == 0) {
                 return -ENODEV; // Device not ready after retries
             }
+#if DT_INST_NODE_HAS_PROP(0, power_gpios)
+            // reboot
+            ret = paw32xx_force_cs(dev, true);
+            if (ret < 0) {
+                return ret;
+            }
+
+            gpio_pin_set_dt(&cfg->power_gpio, 0);
+            k_sleep(K_MSEC(50)); // Wait before retrying
+            gpio_pin_set_dt(&cfg->power_gpio, 1);
+
+            ret = paw32xx_force_cs(dev, false);
+            if (ret < 0) {
+                return ret;
+            }
+#endif
             k_sleep(K_MSEC(100)); // Wait before retrying
             continue;
         }
@@ -404,6 +530,8 @@ static int paw32xx_init(const struct device *dev) {
     }
 
     data->dev = dev;
+    paw32xx_filter_reset(data, k_uptime_get());
+    data->last_motion = 0;
 
     k_work_init(&data->motion_work, paw32xx_motion_work_handler);
     // Initialize the timer for delayed motion checks
@@ -412,6 +540,11 @@ static int paw32xx_init(const struct device *dev) {
 #if DT_INST_NODE_HAS_PROP(0, power_gpios)
     // Initialize power GPIO if defined
     if (gpio_is_ready_dt(&cfg->power_gpio)) {
+        ret = paw32xx_force_cs(dev, true);
+        if (ret != 0) {
+            return ret;
+        }
+
         // Configure as output but start with power OFF
         ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_INACTIVE);
         if (ret != 0) {
@@ -431,6 +564,14 @@ static int paw32xx_init(const struct device *dev) {
 
         // Wait for power stabilization
         k_sleep(K_MSEC(500));
+
+        ret = paw32xx_force_cs(dev, false);
+        if (ret != 0) {
+            return ret;
+        }
+
+        // Wait for power stabilization
+        k_sleep(K_MSEC(50));
     }
 #endif
 
@@ -459,7 +600,7 @@ static int paw32xx_init(const struct device *dev) {
         return ret;
     }
 
-    ret = gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+    ret = paw32xx_interrupt_enable(dev);
     if (ret != 0) {
         LOG_ERR("Motion interrupt configuration failed: %d", ret);
         return ret;
@@ -483,7 +624,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
         // Disable IRQ interrupt
-        ret = gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_DISABLE);
+        ret = paw32xx_interrupt_disable(dev);
         if (ret < 0) {
             LOG_ERR("Failed to disable IRQ interrupt: %d", ret);
             return ret;
@@ -502,29 +643,9 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
             return ret;
         }
 
-#if DT_INST_NODE_HAS_PROP(0, power_gpios)
-        if (gpio_is_ready_dt(&cfg->power_gpio)) {
-            ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_DISCONNECTED);
-            if (ret < 0) {
-                LOG_ERR("Failed to disconnect power: %d", ret);
-                return ret;
-            }
-        }
-#endif
         break;
 
     case PM_DEVICE_ACTION_RESUME:
-#if DT_INST_NODE_HAS_PROP(0, power_gpios)
-        if (gpio_is_ready_dt(&cfg->power_gpio)) {
-            ret = gpio_pin_configure_dt(&cfg->power_gpio, GPIO_OUTPUT_ACTIVE);
-            if (ret < 0) {
-                LOG_ERR("Failed to enable power: %d", ret);
-                return ret;
-            }
-            // Wait for power stabilization
-            k_sleep(K_MSEC(10));
-        }
-#endif
 
         val = 0;
         ret = paw32xx_update_reg(dev, PAW32XX_CONFIGURATION, CONFIGURATION_PD_ENH, val);
@@ -540,7 +661,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         }
 
         // Re-enable IRQ interrupt
-        ret = gpio_pin_interrupt_configure_dt(&cfg->irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+        ret = paw32xx_interrupt_enable(dev);
         if (ret < 0) {
             LOG_ERR("Failed to enable IRQ interrupt: %d", ret);
             return ret;
@@ -568,7 +689,7 @@ static int paw32xx_pm_action(const struct device *dev, enum pm_device_action act
         .power_gpio = GPIO_DT_SPEC_INST_GET_OR(n, power_gpios, {0}),                               \
         .res_cpi = DT_INST_PROP_OR(n, res_cpi, -1),                                                \
         .force_awake = DT_INST_PROP(n, force_awake),                                               \
-        .threshold = DT_INST_PROP(n, motion_threshold),                                            \
+        .motion_threshold = DT_INST_PROP_OR(n, motion_threshold, 0),                               \
     };                                                                                             \
                                                                                                    \
     static struct paw32xx_data paw32xx_data_##n;                                                   \
